@@ -1,4 +1,4 @@
-# stretch4_hybrid_marker_demos
+# stretch4_hybrid_marker_demo
 
 This repository provides demonstrations of the use of hybrid markers with the Stretch 4 mobile manipulator from Hello Robot Inc. Hybrid markers combine LiDAR-reflective material with a visible light ArUco marker to support efficient and robust autonomy.
 
