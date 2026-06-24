@@ -2,7 +2,8 @@
 import rclpy
 from rclpy.node import Node
 from visualization_msgs.msg import MarkerArray, Marker
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PointStamped, Twist
+from sensor_msgs.msg import JointState
 from builtin_interfaces.msg import Duration
 import tf2_ros
 import tf2_geometry_msgs
@@ -10,9 +11,15 @@ import numpy as np
 import time
 import math
 import argparse
-import stretch_body_ii.robot.robot_client as rc
-
+import stretch4_body.robot.robot_client as rc
+from stretch4_body.utils.stretch_pose_models import RobotJoints
 from stretch4_hybrid_marker_demos.joint_speeds import joint_speeds_dict
+from tf2_geometry_msgs import do_transform_point
+from control_msgs.msg import JointJog
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+import xml.etree.ElementTree as ET
+from stretch4_urdf import get_urdf_from_robot_params
 
 class PursueTargetNode(Node):
     def __init__(self, speed='default', enable_translation=True, enable_rotation=True, enable_lift=True, enable_arm=True, enable_gripper=True):
@@ -25,6 +32,7 @@ class PursueTargetNode(Node):
         self.enable_lift = enable_lift
         self.enable_arm = enable_arm
         self.enable_gripper = enable_gripper
+        self.gripper_name = RobotJoints.gripper.value 
         
         # Load independent joint dynamics configurations from joint_speeds.py
         if self.speed not in joint_speeds_dict['lift'] or self.speed not in joint_speeds_dict['gripper'] or self.speed not in joint_speeds_dict['arm']:
@@ -49,7 +57,7 @@ class PursueTargetNode(Node):
         self.wait_count_min = 20
         self.agent_count_min = 5
         self.agent_color_thresh = 0.5 # 128 / 255.0 on Red channel
-        
+
         # Bounding box in base_footprint
         self.bb_x_min = 0.4
         self.bb_x_max = 1.5
@@ -58,6 +66,7 @@ class PursueTargetNode(Node):
         self.bb_z_min = 0.3
         self.bb_z_max = 1.5
         
+
         # State tracking
         # WAITING -> FIXATED
         self.state = "WAITING"
@@ -80,6 +89,15 @@ class PursueTargetNode(Node):
             10
         )
         
+        self.current_aperture = 0.15
+        self.current_arm = 0.0
+        self.sub_joint_states = self.create_subscription(
+            JointState,
+            'joint_states',
+            self.joint_states_callback,
+            10
+        )
+        
         # Publisher for the target visualization
         self.pub_target = self.create_publisher(
             Marker,
@@ -87,6 +105,29 @@ class PursueTargetNode(Node):
             10
         )
         
+        # Publisher for joint velocity jogging
+        self.pub_joint_vel = self.create_publisher(
+            JointJog,
+            'joint_vel',
+            10
+        )
+        
+        # Publisher for base velocity commands
+        self.pub_cmd_vel = self.create_publisher(
+            Twist,
+            'cmd_vel',
+            10
+        )
+        
+        # Service client to set parameters on stretch_driver
+        self.set_param_client = self.create_client(SetParameters, 'stretch_driver/set_parameters')
+        if self.set_param_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().info("Connected to 'stretch_driver/set_parameters' service.")
+            future = self.switch_driver_mode('velocity')
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        else:
+            self.get_logger().warn("Could not connect to 'stretch_driver/set_parameters' service. Mode-dependent features may fail.")
+            
         # Robot Hardware Control
         self.robot = rc.RobotClient()
         if not self.robot.startup():
@@ -96,8 +137,127 @@ class PursueTargetNode(Node):
         # 30Hz Control Loop Timer
         self.control_timer = self.create_timer(0.033, self.control_loop)
         
+        # Parse retracted arm extension offset from URDF once at startup
+        self.retracted_arm_x = self.get_retracted_arm_x()
+        
         self.get_logger().info(f"Pursue Target Node started. Speed: {self.speed}, Trans: {self.enable_translation}, Rot: {self.enable_rotation}, Lift: {self.enable_lift}, Arm: {self.enable_arm}, Gripper: {self.enable_gripper}")
         self.get_logger().info("State: WAITING")
+
+    def get_retracted_arm_x(self):
+        
+        try:
+            root = ET.fromstring(get_urdf_from_robot_params())
+            
+            # Build parent-child and joint maps
+            joints = {}
+            for joint in root.findall('joint'):
+                child_elem = joint.find('child')
+                parent_elem = joint.find('parent')
+                if child_elem is None or parent_elem is None:
+                    continue
+                child = child_elem.get('link')
+                parent = parent_elem.get('link')
+                
+                # Get origin translation and rotation
+                origin = joint.find('origin')
+                xyz = [0.0, 0.0, 0.0]
+                rpy = [0.0, 0.0, 0.0]
+                if origin is not None:
+                    if origin.get('xyz'):
+                        xyz = [float(val) for val in origin.get('xyz').split()]
+                    if origin.get('rpy'):
+                        rpy = [float(val) for val in origin.get('rpy').split()]
+                        
+                joints[child] = {'parent': parent, 'xyz': xyz, 'rpy': rpy}
+                
+            # Helper for rotation matrix from Euler angles (roll, pitch, yaw)
+            def rpy_to_matrix(r, p, y):
+                Rx = np.array([[1.0, 0.0, 0.0],
+                               [0.0, np.cos(r), -np.sin(r)],
+                               [0.0, np.sin(r), np.cos(r)]])
+                Ry = np.array([[np.cos(p), 0.0, np.sin(p)],
+                               [0.0, 1.0, 0.0],
+                               [-np.sin(p), 0.0, np.cos(p)]])
+                Rz = np.array([[np.cos(y), -np.sin(y), 0.0],
+                               [np.sin(y), np.cos(y), 0.0],
+                               [0.0, 0.0, 1.0]])
+                return Rz @ Ry @ Rx
+                
+            # Trace path from grasp center link to base_footprint depending on robot model
+            path = []
+            curr = 'grasp_center_link' if 'grasp_center_link' in joints else 'link_grasp_center'
+            while curr in joints:
+                joint_info = joints[curr]
+                path.append(joint_info)
+                curr = joint_info['parent']
+                
+            # Compute combined transformation matrix
+            T = np.eye(4)
+            for joint in reversed(path):
+                r, p, y = joint['rpy']
+                xyz = joint['xyz']
+                R = rpy_to_matrix(r, p, y)
+                T_step = np.eye(4)
+                T_step[:3, :3] = R
+                T_step[:3, 3] = xyz
+                T = T @ T_step
+                
+            retracted_x = float(T[0, 3])
+            self.get_logger().info(f"Parsed retracted grasp center X offset from URDF: {retracted_x:.4f}m")
+            return retracted_x
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse URDF for retracted arm X: {e}")
+            return 0.18 # Safe fallback
+
+    def joint_states_callback(self, msg):
+        arm_pos = 0.0
+        for name, pos in zip(msg.name, msg.position):
+            if name == 'finger_left_joint':
+                # Parallel gripper: physical position in meters is twice the finger displacement
+                self.current_aperture = 2.0 * abs(pos)
+            elif name == 'gripper_finger_left_joint':
+                # Standard gripper (SG4): aperture = 2 * finger_length * sin(finger_rad)
+                # Standard finger length is 0.0825m
+                self.current_aperture = 2.0 * 0.0825 * math.sin(abs(pos))
+            elif name in ['arm_l1_joint', 'arm_l2_joint', 'arm_l3_joint', 'arm_l4_joint']:
+                arm_pos += pos
+        self.current_arm = arm_pos
+
+    def switch_driver_mode(self, mode_name):
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = 'mode'
+        param.value.type = ParameterType.PARAMETER_STRING
+        param.value.string_value = mode_name
+        req.parameters = [param]
+        return self.set_param_client.call_async(req)
+
+    def jog_gripper(self, displacement):
+        msg = JointJog()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = [f"{self.gripper_name}_joint"]
+        msg.velocities = [displacement / 300.0]
+        self.pub_joint_vel.publish(msg)
+
+    def send_base_velocity(self, v_x, v_y, omega):
+        msg = Twist()
+        msg.linear.x = float(v_x)
+        msg.linear.y = float(v_y)
+        msg.angular.z = float(omega)
+        self.pub_cmd_vel.publish(msg)
+
+    def publish_joint_velocities(self, joint_velocities):
+        """
+        Publishes a JointJog message with the specified joint velocities.
+        joint_velocities is a dict, e.g. {'lift_joint': v_lift, 'arm_joint': v_arm}
+        """
+        if not joint_velocities:
+            return
+        msg = JointJog()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = list(joint_velocities.keys())
+        msg.velocities = list(joint_velocities.values())
+        self.pub_joint_vel.publish(msg)
 
     def transform_point_to_base(self, pt_msg, from_frame, stamp):
         """
@@ -111,10 +271,6 @@ class PursueTargetNode(Node):
             # We want to know where the point is relative to the robot's base *now* or at the stamp time
             # Since MarkerArray uses the exact stamp of the TF tree, this should succeed.
             t = self.tf_buffer.lookup_transform('base_footprint', from_frame, stamp, rclpy.duration.Duration(seconds=0.1))
-            
-            # Use tf2_geometry_msgs to transform the point
-            from tf2_geometry_msgs import do_transform_point
-            from geometry_msgs.msg import PointStamped
             
             ps = PointStamped()
             ps.header.frame_id = from_frame
@@ -237,7 +393,6 @@ class PursueTargetNode(Node):
         marker.pose.position = pt
         marker.pose.orientation.w = 1.0
         
-        # Make a large obvious bounding box (halved width)
         marker.scale.x = 0.15
         marker.scale.y = 0.15
         marker.scale.z = 0.15
@@ -257,47 +412,58 @@ class PursueTargetNode(Node):
         """
         # Pull latest hardware status before control calculations
         self.robot.pull_status()
-        
+
+        # Lookup grasp center TF to dynamically get gripper position depending on robot model
+        base_to_grasp_x = None
+        base_to_grasp_y = None
+        base_to_grasp_z = None
+        for grasp_frame in ["grasp_center_link", "grasp_frame_link"]: 
+            try:
+                t_base_footprint_to_grasp = self.tf_buffer.lookup_transform('base_footprint', grasp_frame, rclpy.time.Time())
+                base_to_grasp_x = t_base_footprint_to_grasp.transform.translation.x
+                base_to_grasp_y = t_base_footprint_to_grasp.transform.translation.y
+                base_to_grasp_z = t_base_footprint_to_grasp.transform.translation.z
+                break
+            except Exception:
+                continue
+                
+        if base_to_grasp_x is None:
+            self.get_logger().warn("Failed to lookup grasp center TF (tried 'grasp_center_link' and 'link_grasp_center')")
+            return
+                
+        # Check target position availability for states requiring target tracking
+        if self.state in ["FIXATED", "GRASPING"]:
+            if not hasattr(self, 'target_pos_base') or self.target_pos_base is None:
+                return
+            base_to_target_x, base_to_target_y, base_to_target_z = self.target_pos_base
+        else:
+            base_to_target_x = 0.0
+            base_to_target_y = 0.0
+            base_to_target_z = 0.0
+
+        # Translational error to bring the target into the gripper's geometric setpoint.
+        grasp_to_target_x = base_to_target_x - base_to_grasp_x 
+        grasp_to_target_y = base_to_target_y - base_to_grasp_y
+        grasp_to_target_z = base_to_target_z - base_to_grasp_z
+
+        # Rotational error to align the gripper's forward line of action with the target.
+        grasp_to_target_theta = math.atan2(grasp_to_target_x, grasp_to_target_y)
+
         if self.state == "FIXATED" and self.target_features is not None:
             # target_features is currently in the frame_id of the MarkerArray (usually /world or base_footprint)
             # We must map it precisely to base_footprint to compute error.
             # However, we only have the point. Let's just lookup the TF and transform it natively.
             
-            # Since target_features is just the geometric point stored during marker_callback,
-            # we need its frame and stamp. Instead of saving those explicitly, we can just save the 
-            # transformed pt_base directly in marker_callback. Let's just calculate the error directly
-            # from a cached base_footprint coordinate.
-            pass # See modified marker_callback for self.target_pos_base 
-            
-            if not hasattr(self, 'target_pos_base') or self.target_pos_base is None:
-                return
-                
-            tx, ty, tz = self.target_pos_base
-            
-            # Simple Kinematic Model for the Gripper Pursuit
-            # The gripper is located to the right of the base center line
-            gripper_offset_y = -0.095
-            
-            # We want the target to be 0.5m forward relative to the base, and centered on the gripper
-            target_distance_x = 0.6
-            
-            # Map the target coordinates into the gripper's frame of reference
-            tx_gripper = tx
-            ty_gripper = ty - gripper_offset_y
-            
-            # Translational error to bring the target into the gripper's geometric setpoint
-            e_x = tx_gripper - target_distance_x
-            e_y = ty_gripper - 0.0
-            
-            # Rotational error to aim the gripper's forward line of action at the target.
-            # By tracking the offset angle, the robot's center line points 0.095m to the left of the target,
-            # which perfectly aligns the right-mounted gripper.
-            e_theta = math.atan2(ty_gripper, tx_gripper) 
-            
+            e_x = grasp_to_target_x - 0.20
+            e_y = grasp_to_target_y
+            e_z = grasp_to_target_z
+            e_theta = math.atan2(e_x, e_y)
+
             # Proportional Gains mapped to requested speed
             Kp = { 'slow': 0.1, 'default': 0.12, 'fast': 0.2, 'max': 0.5 }.get(self.speed, 0.12)
             Kw = { 'slow': 0.5, 'default': 0.75, 'fast': 1.0, 'max': 2.0 }.get(self.speed, 0.75)
             
+            # Base Velocity Control
             v_x = Kp * e_x if self.enable_translation else 0.0
             v_y = Kp * e_y if self.enable_translation else 0.0
             omega = Kw * e_theta if self.enable_rotation else 0.0
@@ -317,88 +483,99 @@ class PursueTargetNode(Node):
             if abs(e_theta) < math.radians(2.0):
                 omega = 0.0
                 
-            self.robot.base.set_velocity(v_x, v_y, omega)
+            self.send_base_velocity(v_x, v_y, omega)
             
-            # Lift Proportional Position Tracker
+            # Lift, Arm & Gripper Velocity Control
+            joint_vels = {}
             if self.enable_lift:
-                target_lift = tz - 0.14
-                # Clip rigidly to safe bounds
-                cmd_lift = float(np.clip(target_lift, 0.2, 1.1))
-                
-                # Check deadband for the lift to prevent constant micro-adjustments
-                # Need to read the current lift position; we can query status if it's updated, 
-                # but move_to with a small delta usually handles this natively in the firmware safely.
-                self.robot.lift.move_to(cmd_lift, v_m=self.lift_v, a_m=self.lift_a)
-                
-            # Arm Keep-out Zone (Retracted)
+                # Track target height (Z-axis offset) with the lift joint
+                joint_vels['lift_joint'] = float(np.clip(Kp * e_z, -self.lift_v, self.lift_v))
             if self.enable_arm:
-                self.robot.arm.move_to(0.01, v_m=self.arm_v, a_m=self.arm_a)
-                
-            # Gripper Proportional Tracker (Open when Fixated)
+                # Keep arm retracted at a safe position (0.01m) during target alignment/fixation
+                e_arm = 0.01 - self.current_arm
+                joint_vels['arm_joint'] = float(np.clip(3.0 * e_arm, -self.arm_v, self.arm_v))
             if self.enable_gripper:
-                self.robot.end_of_arm.move_by('stretch_gripper', self.gripper_pct, self.gripper_v, self.gripper_a)
-                
-            self.robot.push_command()
+                # Keep the gripper open while fixating on target to prepare for grasp
+                joint_vels[f"{self.gripper_name}_joint"] = self.gripper_pct / 300.0
+            
+            if joint_vels:
+                self.publish_joint_velocities(joint_vels)
             
         elif self.state == "GRASPING" and self.target_features is not None:
             # Base must not move
-            self.robot.base.set_velocity(0.0, 0.0, 0.0)
-            
-            # Still track lift height if possible to not smash it against edges
-            if hasattr(self, 'target_pos_base') and self.target_pos_base is not None and self.enable_lift:
-                tz = self.target_pos_base[2]
-                target_lift = tz - 0.14
-                cmd_lift = float(np.clip(target_lift, 0.2, 1.1))
-                self.robot.lift.move_to(cmd_lift, v_m=self.lift_v, a_m=self.lift_a)
-                
-            # Read gripper status unconditionally for both arm and gripper logic
-            gripper_status = self.robot.end_of_arm.status.get('stretch_gripper', {})
-            current_aperture = float(gripper_status.get('gripper_conversion', {}).get('aperture_m', 0.15))
+            self.send_base_velocity(0.0, 0.0, 0.0)
+
+            joint_vels = {}
+            # Align lift with target Z height during grasp
+            if self.enable_lift:
+                joint_vels['lift_joint'] = float(np.clip(Kp * grasp_to_target_z, -self.lift_v, self.lift_v))
+
+            # Get current aperture dynamically from joint states topic
+            current_aperture = self.current_aperture
             target_aperture = 0.03
-            print('current aperture: ', current_aperture)
             if self.enable_gripper:
+                # Goal: Close the gripper to target aperture (0.03m) to secure the object
                 # Closed-loop tracking for constant aperture with wider deadband to prevent oscillation
                 if current_aperture > (target_aperture + 0.015):
-                    self.robot.end_of_arm.move_by('stretch_gripper', -self.gripper_pct, self.gripper_v, self.gripper_a)
+                    joint_vels[f"{self.gripper_name}_joint"] = -self.gripper_pct / 300.0
                 elif current_aperture < (target_aperture - 0.015):
-                    self.robot.end_of_arm.move_by('stretch_gripper', self.gripper_pct, self.gripper_v, self.gripper_a)
+                    joint_vels[f"{self.gripper_name}_joint"] = self.gripper_pct / 300.0
                     
             # Reach out or retract based on grasp success
             if self.enable_arm:
                 # If within 0.05m of target aperture, consider grasp successful and retract
                 if abs(current_aperture - target_aperture) <= 0.05:
-                    self.robot.arm.move_to(0.01, v_m=self.arm_v, a_m=self.arm_a)
+                    e_arm = 0.01 - self.current_arm
                 else:
-                    self.robot.arm.move_to(0.12, v_m=self.arm_v, a_m=self.arm_a)
-
-            self.robot.push_command()
-            
+                    # Extend the arm until there is no x error relative to target along grasp center's X-axis
+                    e_arm = grasp_to_target_x
+                joint_vels['arm_joint'] = float(np.clip(3.0 * e_arm, -self.arm_v, self.arm_v))
+                
+            if joint_vels:
+                self.publish_joint_velocities(joint_vels)
+    
         elif self.state == "WAITING":
             # Just ensure we are stopped
-            self.robot.base.set_velocity(0.0, 0.0, 0.0)
+            self.send_base_velocity(0.0, 0.0, 0.0)
             
+            joint_vels = {}
             # Reposition Arm
             if self.enable_arm:
-                self.robot.arm.move_to(0.01, v_m=self.arm_v, a_m=self.arm_a)
+                # Goal: Keep the arm retracted (0.01m) while waiting for target detection
+                e_arm = 0.01 - self.current_arm
+                joint_vels['arm_joint'] = float(np.clip(3.0 * e_arm, -self.arm_v, self.arm_v))
             
             # Gripper Proportional Tracker (Lightly close when Waiting)
             if self.enable_gripper:
-                gripper_status = self.robot.end_of_arm.status.get('stretch_gripper', {})
-                current_aperture = float(gripper_status.get('gripper_conversion', {}).get('aperture_m', 0.15))
+                # Goal: Gently close/maintain gripper aperture (0.03m) while waiting to reduce footprint
+                current_aperture = self.current_aperture
                 target_aperture = 0.03
                 
                 # Maintain the closed-loop constant aperture with very gentle steps and wide deadband
                 if current_aperture > (target_aperture + 0.015):
-                    self.robot.end_of_arm.move_by('stretch_gripper', -5.0, self.gripper_v, self.gripper_a)
+                    joint_vels[f"{self.gripper_name}_joint"] = -5.0 / 300.0
                 elif current_aperture < (target_aperture - 0.015):
-                    self.robot.end_of_arm.move_by('stretch_gripper', 5.0, self.gripper_v, self.gripper_a)
+                    joint_vels[f"{self.gripper_name}_joint"] = 5.0 / 300.0
                     
-            self.robot.push_command()
+            if joint_vels:
+                self.publish_joint_velocities(joint_vels)
             
     def destroy_node(self):
+        # Switch mode back to navigation
+        if hasattr(self, 'set_param_client') and self.set_param_client.service_is_ready():
+            self.get_logger().info("Resetting stretch_driver mode to navigation...")
+            req = SetParameters.Request()
+            param = Parameter()
+            param.name = 'mode'
+            param.value.type = ParameterType.PARAMETER_STRING
+            param.value.string_value = 'navigation'
+            req.parameters = [param]
+            future = self.set_param_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+            
+        # Stop the base
+        self.send_base_velocity(0.0, 0.0, 0.0)
         super().destroy_node()
-        self.robot.base.set_velocity(0.0, 0.0, 0.0)
-        self.robot.push_command()
         self.robot.stop()
 
 def main():

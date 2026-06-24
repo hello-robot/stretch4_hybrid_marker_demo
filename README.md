@@ -113,7 +113,7 @@ ros2 run stretch4_hybrid_marker_demos ros_pursue_target --speed fast --disable_a
 
 ## Technical Details: How the Demo Works
 
-The `ros_pursue_target` demo is implemented as a ROS 2 node that interacts with the robot hardware using `stretch_body_ii` and subscribes to perception topics from the hybrid marker tracking pipeline.
+The `ros_pursue_target` demo is implemented as a ROS 2 node that interacts with the robot hardware using `stretch4_body` and subscribes to perception topics from the hybrid marker tracking pipeline.
 
 ### 1. State Machine
 The robot operates via a simple finite state machine consisting of three states:
