@@ -10,7 +10,7 @@ import numpy as np
 import time
 import math
 import argparse
-import stretch_body_ii.robot.robot_client as rc
+import stretch4_body.robot.robot_client as rc
 
 from stretch4_hybrid_marker_demos.joint_speeds import joint_speeds_dict
 
