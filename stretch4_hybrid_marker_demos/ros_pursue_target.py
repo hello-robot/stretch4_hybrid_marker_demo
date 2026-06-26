@@ -11,7 +11,6 @@ import numpy as np
 import time
 import math
 import argparse
-import stretch4_body.robot.robot_client as rc
 from stretch4_body.utils.stretch_pose_models import RobotJoints
 from stretch4_hybrid_marker_demos.joint_speeds import joint_speeds_dict
 from tf2_geometry_msgs import do_transform_point
@@ -33,12 +32,13 @@ class PursueTargetNode(Node):
         self.enable_arm = enable_arm
         self.enable_gripper = enable_gripper
         self.gripper_name = RobotJoints.gripper.value 
-        
+        self.grasp_frame = "grasp_center_link"
+       
         # Load independent joint dynamics configurations from joint_speeds.py
         if self.speed not in joint_speeds_dict['lift'] or self.speed not in joint_speeds_dict['gripper'] or self.speed not in joint_speeds_dict['arm']:
             self.get_logger().error(f"Configured speed '{self.speed}' not found in joint_speeds_dict. Defaulting to 'default'.")
             self.speed = 'default'
-            
+
         self.lift_v = joint_speeds_dict['lift'][self.speed]['vel_m']
         self.lift_a = joint_speeds_dict['lift'][self.speed]['accel_m']
         
@@ -47,12 +47,12 @@ class PursueTargetNode(Node):
         
         self.gripper_v = joint_speeds_dict['gripper'][self.speed]['vel']
         self.gripper_a = joint_speeds_dict['gripper'][self.speed]['accel']
-        self.gripper_pct = {
-            'slow': 10.0,
-            'default': 30.0,
-            'fast': 60.0,
-            'max': 60.0
-        }.get(self.speed, 15.0)
+        
+        # Determine gripper command velocity using named open/close poses and a standard scale
+        poses = RobotJoints.gripper.poses
+        range_standard = abs(poses['open'] - poses['close'])
+        scale = {'slow': 0.05, 'default': 0.15, 'fast': 0.30, 'max': 0.30}.get(self.speed, 0.15)
+        self.gripper_vel_cmd = range_standard * scale
         self.wait_time_sec = 2.0
         self.wait_count_min = 20
         self.agent_count_min = 5
@@ -65,7 +65,6 @@ class PursueTargetNode(Node):
         self.bb_y_max = 0.5
         self.bb_z_min = 0.3
         self.bb_z_max = 1.5
-        
 
         # State tracking
         # WAITING -> FIXATED
@@ -89,8 +88,10 @@ class PursueTargetNode(Node):
             10
         )
         
-        self.current_aperture = 0.15
+        self.current_gripper = 0.0
         self.current_arm = 0.0
+        self.current_wrists = {}
+        
         self.sub_joint_states = self.create_subscription(
             JointState,
             'joint_states',
@@ -128,12 +129,9 @@ class PursueTargetNode(Node):
         else:
             self.get_logger().warn("Could not connect to 'stretch_driver/set_parameters' service. Mode-dependent features may fail.")
             
-        # Robot Hardware Control
-        self.robot = rc.RobotClient()
-        if not self.robot.startup():
-            self.get_logger().fatal("Failed to connect to Stretch hardware.")
-            raise RuntimeError("Stretch hardware not found.")
-            
+        # Let subscribers build up a buffer
+        self.center_wrist()
+
         # 30Hz Control Loop Timer
         self.control_timer = self.create_timer(0.033, self.control_loop)
         
@@ -185,12 +183,11 @@ class PursueTargetNode(Node):
                 
             # Trace path from grasp center link to base_footprint depending on robot model
             path = []
-            curr = 'grasp_center_link' if 'grasp_center_link' in joints else 'link_grasp_center'
-            while curr in joints:
-                joint_info = joints[curr]
+            while self.grasp_frame in joints:
+                joint_info = joints[self.grasp_frame]
                 path.append(joint_info)
-                curr = joint_info['parent']
-                
+                self.grasp_frame = joint_info['parent']
+
             # Compute combined transformation matrix
             T = np.eye(4)
             for joint in reversed(path):
@@ -212,15 +209,13 @@ class PursueTargetNode(Node):
     def joint_states_callback(self, msg):
         arm_pos = 0.0
         for name, pos in zip(msg.name, msg.position):
-            if name == 'finger_left_joint':
-                # Parallel gripper: physical position in meters is twice the finger displacement
-                self.current_aperture = 2.0 * abs(pos)
-            elif name == 'gripper_finger_left_joint':
-                # Standard gripper (SG4): aperture = 2 * finger_length * sin(finger_rad)
-                # Standard finger length is 0.0825m
-                self.current_aperture = 2.0 * 0.0825 * math.sin(abs(pos))
-            elif name in ['arm_l1_joint', 'arm_l2_joint', 'arm_l3_joint', 'arm_l4_joint']:
+            if name in RobotJoints.gripper.finger_joints:
+                # Keep position directly in URDF units
+                self.current_gripper = pos
+            elif name in RobotJoints.arm.arm_joints:
                 arm_pos += pos
+            elif 'wrist' in name:
+                self.current_wrists[name] = pos
         self.current_arm = arm_pos
 
     def switch_driver_mode(self, mode_name):
@@ -233,11 +228,7 @@ class PursueTargetNode(Node):
         return self.set_param_client.call_async(req)
 
     def jog_gripper(self, displacement):
-        msg = JointJog()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = [f"{self.gripper_name}_joint"]
-        msg.velocities = [displacement / 300.0]
-        self.pub_joint_vel.publish(msg)
+        self.publish_joint_velocities({f"{self.gripper_name}_joint": displacement / 300.0})
 
     def send_base_velocity(self, v_x, v_y, omega):
         msg = Twist()
@@ -253,6 +244,7 @@ class PursueTargetNode(Node):
         """
         if not joint_velocities:
             return
+
         msg = JointJog()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.joint_names = list(joint_velocities.keys())
@@ -405,32 +397,52 @@ class PursueTargetNode(Node):
         
         self.pub_target.publish(marker)
 
+    def center_wrist(self):
+        self.send_base_velocity(0.0, 0.0, 0.0)
+        
+        # If we haven't received joint states yet, wait
+        if not self.current_wrists:
+            return
+            
+        joint_vels = {}
+        Kp_wrist = 3.0
+        aligned = True
+        
+        for joint_name, current_pos in self.current_wrists.items():
+            err = 0.0 - current_pos
+            if abs(err) >= 0.02:
+                aligned = False
+            joint_vels[joint_name] = float(np.clip(Kp_wrist * err, -0.5, 0.5))
+            
+        if aligned:
+            self.get_logger().info("Wrist joints aligned to zero. Transitioning to WAITING.")
+            self.state = "WAITING"
+            # Stop all wrist velocities
+            stop_vels = {j: 0.0 for j in self.current_wrists.keys()}
+            self.publish_joint_velocities(stop_vels)
+        else:
+            self.publish_joint_velocities(joint_vels)
+        return
+
     def control_loop(self):
         """
         Runs at 30Hz to command the omnibase to pursue the target object.
         Goal is to keep the target at the gripper's offset (x=0.5m, y=-0.095m relative to base).
         """
-        # Pull latest hardware status before control calculations
-        self.robot.pull_status()
-
         # Lookup grasp center TF to dynamically get gripper position depending on robot model
         base_to_grasp_x = None
         base_to_grasp_y = None
         base_to_grasp_z = None
-        for grasp_frame in ["grasp_center_link", "grasp_frame_link"]: 
-            try:
-                t_base_footprint_to_grasp = self.tf_buffer.lookup_transform('base_footprint', grasp_frame, rclpy.time.Time())
-                base_to_grasp_x = t_base_footprint_to_grasp.transform.translation.x
-                base_to_grasp_y = t_base_footprint_to_grasp.transform.translation.y
-                base_to_grasp_z = t_base_footprint_to_grasp.transform.translation.z
-                break
-            except Exception:
-                continue
-                
-        if base_to_grasp_x is None:
-            self.get_logger().warn("Failed to lookup grasp center TF (tried 'grasp_center_link' and 'link_grasp_center')")
+
+        try:
+            t_base_footprint_to_grasp = self.tf_buffer.lookup_transform('base_footprint', self.grasp_frame, rclpy.time.Time())
+            base_to_grasp_x = t_base_footprint_to_grasp.transform.translation.x
+            base_to_grasp_y = t_base_footprint_to_grasp.transform.translation.y
+            base_to_grasp_z = t_base_footprint_to_grasp.transform.translation.z
+        except Exception as e:
+            self.get_logger().warn(f"Failed to lookup TF from 'base_footprint to '{self.grasp_frame}': {e}")
             return
-                
+
         # Check target position availability for states requiring target tracking
         if self.state in ["FIXATED", "GRASPING"]:
             if not hasattr(self, 'target_pos_base') or self.target_pos_base is None:
@@ -496,7 +508,8 @@ class PursueTargetNode(Node):
                 joint_vels['arm_joint'] = float(np.clip(3.0 * e_arm, -self.arm_v, self.arm_v))
             if self.enable_gripper:
                 # Keep the gripper open while fixating on target to prepare for grasp
-                joint_vels[f"{self.gripper_name}_joint"] = self.gripper_pct / 300.0
+                # In URDF units, opening requires positive velocity
+                joint_vels[f"{self.gripper_name}_joint"] = self.gripper_vel_cmd
             
             if joint_vels:
                 self.publish_joint_velocities(joint_vels)
@@ -510,21 +523,25 @@ class PursueTargetNode(Node):
             if self.enable_lift:
                 joint_vels['lift_joint'] = float(np.clip(Kp * grasp_to_target_z, -self.lift_v, self.lift_v))
 
-            # Get current aperture dynamically from joint states topic
-            current_aperture = self.current_aperture
-            target_aperture = 0.03
+            # Get current gripper position (URDF units)
+            current_gripper = self.current_gripper
+            target_gripper = RobotJoints.gripper.aperture_to_urdf(0.03)
+            deadband = abs(RobotJoints.gripper.aperture_to_urdf(0.03 + 0.015) - target_gripper)
             if self.enable_gripper:
                 # Goal: Close the gripper to target aperture (0.03m) to secure the object
                 # Closed-loop tracking for constant aperture with wider deadband to prevent oscillation
-                if current_aperture > (target_aperture + 0.015):
-                    joint_vels[f"{self.gripper_name}_joint"] = -self.gripper_pct / 300.0
-                elif current_aperture < (target_aperture - 0.015):
-                    joint_vels[f"{self.gripper_name}_joint"] = self.gripper_pct / 300.0
+                if current_gripper > (target_gripper + deadband):
+                    # Too open, so close it (negative velocity)
+                    joint_vels[f"{self.gripper_name}_joint"] = -self.gripper_vel_cmd
+                elif current_gripper < (target_gripper - deadband):
+                    # Too closed, so open it (positive velocity)
+                    joint_vels[f"{self.gripper_name}_joint"] = self.gripper_vel_cmd
                     
             # Reach out or retract based on grasp success
             if self.enable_arm:
                 # If within 0.05m of target aperture, consider grasp successful and retract
-                if abs(current_aperture - target_aperture) <= 0.05:
+                success_tolerance = abs(RobotJoints.gripper.aperture_to_urdf(0.03 + 0.05) - target_gripper)
+                if abs(current_gripper - target_gripper) <= success_tolerance:
                     e_arm = 0.01 - self.current_arm
                 else:
                     # Extend the arm until there is no x error relative to target along grasp center's X-axis
@@ -548,14 +565,15 @@ class PursueTargetNode(Node):
             # Gripper Proportional Tracker (Lightly close when Waiting)
             if self.enable_gripper:
                 # Goal: Gently close/maintain gripper aperture (0.03m) while waiting to reduce footprint
-                current_aperture = self.current_aperture
-                target_aperture = 0.03
+                current_gripper = self.current_gripper
+                target_gripper = RobotJoints.gripper.aperture_to_urdf(0.03)
+                deadband = abs(RobotJoints.gripper.aperture_to_urdf(0.03 + 0.015) - target_gripper)
                 
                 # Maintain the closed-loop constant aperture with very gentle steps and wide deadband
-                if current_aperture > (target_aperture + 0.015):
-                    joint_vels[f"{self.gripper_name}_joint"] = -5.0 / 300.0
-                elif current_aperture < (target_aperture - 0.015):
-                    joint_vels[f"{self.gripper_name}_joint"] = 5.0 / 300.0
+                if current_gripper > (target_gripper + deadband):
+                    joint_vels[f"{self.gripper_name}_joint"] = -self.gripper_vel_cmd * (5.0 / 30.0)
+                elif current_gripper < (target_gripper - deadband):
+                    joint_vels[f"{self.gripper_name}_joint"] = self.gripper_vel_cmd * (5.0 / 30.0)
                     
             if joint_vels:
                 self.publish_joint_velocities(joint_vels)
@@ -576,7 +594,6 @@ class PursueTargetNode(Node):
         # Stop the base
         self.send_base_velocity(0.0, 0.0, 0.0)
         super().destroy_node()
-        self.robot.stop()
 
 def main():
     parser = argparse.ArgumentParser(description='Omnibase Target Pursuit for Stretch.')
